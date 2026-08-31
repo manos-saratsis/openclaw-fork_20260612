@@ -2,9 +2,13 @@ import Foundation
 #if canImport(Darwin)
 import Darwin
 #endif
+#if canImport(Security)
+import Security
+#endif
 
 private let appDefaultsSuites = ["ai.openclaw.mac", "ai.openclaw.mac.debug"]
 private let appOnboardingVersion = 7
+private let keychainService = "ai.openclaw.mac.remote-gateway"
 
 struct ConfigureRemoteOptions {
     var sshTarget: String?
@@ -149,6 +153,11 @@ private func configureSSHRemote(
     let existingTarget = (remote["sshTarget"] as? String)?
         .trimmingCharacters(in: .whitespacesAndNewlines)
 
+    let existingToken = remote["token"] as? String
+    let existingPassword = remote["password"] as? String
+    remote.removeValue(forKey: "token")
+    remote.removeValue(forKey: "password")
+
     gateway["mode"] = "remote"
     gateway["port"] = opts.localPort
     remote["transport"] = "ssh"
@@ -164,8 +173,8 @@ private func configureSSHRemote(
         ?? "strict"
     remote["sshHostKeyPolicy"] = sshHostKeyPolicy
     updateStringIfProvided(&remote, key: "sshIdentity", value: opts.identity)
-    updateStringIfProvided(&remote, key: "token", value: opts.token)
-    updateStringIfProvided(&remote, key: "password", value: opts.password)
+    try syncRemoteSecret(&remote, key: "token", newValue: opts.token, existingValue: existingToken)
+    try syncRemoteSecret(&remote, key: "password", newValue: opts.password, existingValue: existingPassword)
     gateway["remote"] = remote
     root["gateway"] = gateway
 
@@ -206,6 +215,11 @@ private func configureDirectRemote(
     var gateway = root["gateway"] as? [String: Any] ?? [:]
     var remote = gateway["remote"] as? [String: Any] ?? [:]
 
+    let existingToken = remote["token"] as? String
+    let existingPassword = remote["password"] as? String
+    remote.removeValue(forKey: "token")
+    remote.removeValue(forKey: "password")
+
     gateway["mode"] = "remote"
     remote["transport"] = "direct"
     remote["url"] = directURL.absoluteString
@@ -213,8 +227,8 @@ private func configureDirectRemote(
     remote.removeValue(forKey: "sshTarget")
     remote.removeValue(forKey: "sshIdentity")
     remote.removeValue(forKey: "sshHostKeyPolicy")
-    updateStringIfProvided(&remote, key: "token", value: opts.token)
-    updateStringIfProvided(&remote, key: "password", value: opts.password)
+    try syncRemoteSecret(&remote, key: "token", newValue: opts.token, existingValue: existingToken)
+    try syncRemoteSecret(&remote, key: "password", newValue: opts.password, existingValue: existingPassword)
     gateway["remote"] = remote
     root["gateway"] = gateway
 
@@ -244,6 +258,7 @@ private func saveConfigRoot(_ root: [String: Any], to url: URL) throws {
     try FileManager().createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
     let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
     try data.write(to: url, options: [.atomic])
+    try FileManager().setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
 }
 
 private func writeAppDefaults(opts: ConfigureRemoteOptions, target: String, suites: [String]) {
@@ -378,6 +393,80 @@ private func updateStringIfProvided(_ dictionary: inout [String: Any], key: Stri
     } else {
         dictionary[key] = trimmed
     }
+}
+
+private func syncRemoteSecret(
+    _ remote: inout [String: Any],
+    key: String,
+    newValue: String?,
+    existingValue: String?
+) throws {
+    if let newValue = newValue {
+        let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            deleteSecretFromKeychain(account: key)
+            remote.removeValue(forKey: key)
+        } else {
+            try storeSecretInKeychain(trimmed, account: key)
+            remote[key] = "keychain:\(key)"
+        }
+        return
+    }
+
+    if let existingValue = existingValue, !existingValue.isEmpty {
+        if existingValue.hasPrefix("keychain:") {
+            if secretInKeychain(account: key) != nil {
+                remote[key] = existingValue
+            }
+        } else {
+            try storeSecretInKeychain(existingValue, account: key)
+            remote[key] = "keychain:\(key)"
+        }
+        return
+    }
+
+    if secretInKeychain(account: key) != nil {
+        remote[key] = "keychain:\(key)"
+    }
+}
+
+private func storeSecretInKeychain(_ secret: String, account: String) throws {
+    let data = Data(secret.utf8)
+    let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: keychainService,
+        kSecAttrAccount as String: account,
+        kSecValueData as String: data,
+        kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
+    ]
+    SecItemDelete(query as CFDictionary)
+    let status = SecItemAdd(query as CFDictionary, nil)
+    guard status == errSecSuccess else {
+        throw NSError(domain: NSOSStatusErrorDomain, code: Int(status))
+    }
+}
+
+private func deleteSecretFromKeychain(account: String) {
+    let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: keychainService,
+        kSecAttrAccount as String: account
+    ]
+    SecItemDelete(query as CFDictionary)
+}
+
+private func secretInKeychain(account: String) -> String? {
+    let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: keychainService,
+        kSecAttrAccount as String: account,
+        kSecReturnData as String: true,
+        kSecMatchLimit as String: kSecMatchLimitOne
+    ]
+    var item: CFTypeRef?
+    let status = SecItemCopyMatching(query as CFDictionary, &item)
+    guard status == errSecSuccess, let data = item as? Data else { return nil }
+    return String(data: data, encoding: .utf8)
 }
 
 private func parsePort(_ raw: String) -> Int? {
