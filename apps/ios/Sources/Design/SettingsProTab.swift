@@ -1,4 +1,5 @@
 import OpenClawKit
+import Security
 import SwiftUI
 
 struct GatewaySetupRequest {
@@ -10,6 +11,65 @@ enum GatewayConnectionAttempt: Equatable {
     case gateway(GatewayStableIdentifier.Key)
     case manual
     case setupCode
+}
+
+private enum GatewaySetupCodeKeychain {
+    private static let service = "com.openclaw.ios.gateway-setup-code"
+    private static let account = "gateway.setupCode"
+
+    static func load() -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: Self.service,
+            kSecAttrAccount as String: Self.account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess,
+              let data = result as? Data,
+              let value = String(data: data, encoding: .utf8)
+        else { return nil }
+        return value
+    }
+
+    static func save(_ value: String) {
+        guard !value.isEmpty else {
+            delete()
+            return
+        }
+        guard let data = value.data(using: .utf8) else { return }
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: Self.service,
+            kSecAttrAccount as String: Self.account
+        ]
+        let attributes: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        ]
+        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if status == errSecItemNotFound {
+            var newItem = query
+            newItem[kSecValueData as String] = data
+            newItem[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            SecItemAdd(newItem as CFDictionary, nil)
+        }
+    }
+
+    static func delete() {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: Self.service,
+            kSecAttrAccount as String: Self.account
+        ]
+        SecItemDelete(query as CFDictionary)
+    }
+
+    static func removeLegacyValue() {
+        UserDefaults.standard.removeObject(forKey: "gateway.setupCode")
+    }
 }
 
 struct SettingsProTab: View {
@@ -39,7 +99,7 @@ struct SettingsProTab: View {
     @AppStorage("gateway.manual.tls") var manualGatewayTLS: Bool = true
     @AppStorage("gateway.discovery.debugLogs") var discoveryDebugLogsEnabled: Bool = false
     @AppStorage("canvas.debugStatusEnabled") var canvasDebugStatusEnabled: Bool = false
-    @AppStorage("gateway.setupCode") var setupCode: String = ""
+    @State var setupCode: String = ""
     @AppStorage("gateway.onboardingComplete") var onboardingComplete: Bool = false
     @AppStorage("gateway.hasConnectedOnce") var hasConnectedOnce: Bool = false
     @AppStorage("onboarding.requestID") var onboardingRequestID: Int = 0
@@ -122,6 +182,8 @@ struct SettingsProTab: View {
         self.onApprovalNotificationsRoute = onApprovalNotificationsRoute
         self.gatewaySetupRequest = gatewaySetupRequest
         self.onGatewaySetupRequestHandled = onGatewaySetupRequestHandled
+        _setupCode = State(initialValue: GatewaySetupCodeKeychain.load() ?? "")
+        GatewaySetupCodeKeychain.removeLegacyValue()
     }
 
     var body: some View {
@@ -214,6 +276,7 @@ struct SettingsProTab: View {
                 if !newValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     self.clearStagedGatewaySetupLink()
                 }
+                GatewaySetupCodeKeychain.save(newValue)
             }
             .onChange(of: self.defaultShareInstruction) { _, newValue in
                 ShareToAgentSettings.saveDefaultInstruction(newValue)
